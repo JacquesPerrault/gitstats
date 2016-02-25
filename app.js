@@ -11,6 +11,8 @@ var config            = require('./config');
 var orgs              = require(config.orgsfile);
 var uuid              = require('uuid');
 var url               = require('url');
+var redis             = require('redis');
+var winston           = require('winston');
 var gittoken          = config.git.personaltoken;
 var db_protocol       = config.db.protocol === 'https:' ? https : http;
 //var git_protocol      = config.git.protocol === 'https:' ? https : http;
@@ -28,10 +30,7 @@ var pendingqueue      = [];
 var pendingqueue_db   = [];
 
 
-// initialize IBM BlueMix
-//var bluemix           = require('ibmbluemix');
-var winston           = require('winston');
-
+// initialize logger
 var logger = new (winston.Logger)({
     transports: [
         new (winston.transports.Console)({level: 'info'}),
@@ -42,6 +41,17 @@ var logger = new (winston.Logger)({
     methodname:true,
     linenumber: true,
     exitOnError: false
+});
+
+
+// initialize redis
+var redisclient = redis.createClient(config.redis.port, config.redis.hostname, {no_ready_check: true});
+redisclient.auth(config.redis.password, function (err) {
+    if (err) logger.error('REDIS: ERROR: ', err.statusCode, err.message);
+});
+
+redisclient.on('connect', function() {
+    logger.info('Connected to Redis');
 });
 
 
@@ -83,9 +93,6 @@ var optionsgit = {
 
 var db_keepAliveAgent = new db_protocol.Agent(optionsdb);
 //var git_keepAliveAgent = new git_protocol.Agent(optionsgit);
-
-//var T               = new Throttler(config);
-
 
 
 
@@ -219,8 +226,9 @@ function process_queue_db() {
 }
 
 
+// push items to redis
 function throttle(item) {
-    counter++;
+/*    counter++;
     item.counter = counter;
     stack.push(item);
     openqueue.push(item.opts.path);
@@ -228,6 +236,11 @@ function throttle(item) {
     if (timer === null) {
       timer = setInterval(process_queue, config.interval_git);
     }
+*/
+    redisclient.rpush('github', JSON.stringify(item),function(err,reply){
+        if (err) logger.error('REDIS: ERROR: ', err.statusCode, err.message);
+    });
+    redisclient.llen('github', function(err,reply){logger.info('redis: ',reply)});
 }
 
 function throttle_db(item) {
@@ -242,6 +255,30 @@ function throttle_db(item) {
     }
 }
 
+// this function ensures the stack doesn't exceed node's memory limits
+// if timer is null, stack is empty; if redis has items, pop up to ten
+// of them to the stack.
+function monitor(){
+    redisclient.llen('github', function(err,reply){
+      logger.info('llen: ', reply);
+        if ((timer === null) && (reply > 0)) {
+            redisclient.lrange('github', 0, 9, function (err, reply) {
+                reply.forEach(function(item){
+                    counter++;
+                    item.counter = counter;
+                    stack.push(item);
+                    //openqueue.push(item.opts.path);
+                    pendingqueue.push(item);
+                    //timer = setInterval(process_queue, config.interval_git);
+                });
+                  // remove the first ten items from redis
+                  redisclient.ltrim('github', 10, -1);
+                  logger.info('chunk: ' + stack + '\n\n');
+            });
+            
+        }
+    });
+}
 
 // this will process the link header (if present) and invoke the requested function if a next header is present
 function get_more(response, func) {
@@ -623,7 +660,7 @@ function init_db() {
 }
 
 function create_db() {
-    if (stack.length === 0)
+    if ((stack.length === 0) && (stack_db.length === 0)) 
     {
         var opts = clone(optionsdb);
         opts.method = 'PUT';
@@ -841,11 +878,11 @@ process.on('uncaughtException', function (e) {
   clearInterval(timer_db);
   timer_db = null;
 
-  logger.warn('--- REQUEUING...');
+/*  logger.warn('--- REQUEUING...');
   stack = pendingqueue;
   stack_db = pendingqueue_db;
   timer = setInterval(process_queue, config.interval_git);
-  timer_db = setInterval(process_queue_db, config.interval_db);
+  timer_db = setInterval(process_queue_db, config.interval_db);*/
 });
 
 
@@ -855,6 +892,8 @@ setInterval(function () {
   logger.info('---: Refreshed data at: ' + Date.now());
 }, 3600000);
 
+
+var monitor = setInterval(monitor, 1000);
 
 
 function handleRequest(request, response){
@@ -882,7 +921,12 @@ process.on( 'SIGINT', function() {
     logger.error( '\nGracefully shutting down from SIGINT (Ctrl-C)' );
     logger.error( '\nPending queue:' );
 
+    logger.info('flushing redis db: ', redisclient.flushdb());
+    logger.info('shutting down redis: ', redisclient.quit());
+
     clearInterval(timer);
     timer = null;
+    clearInterval(monitor);
+    monitor = null;
     process.exit();
 })
